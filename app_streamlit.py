@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import streamlit as st
 import mlflow
 import mlflow.pyfunc
@@ -71,11 +72,62 @@ with tab1:
     }
     df_single = pd.DataFrame([row])
 
+    def _ensure_model_columns(df_in: pd.DataFrame, model) -> pd.DataFrame:
+        """Ensure the DataFrame contains all columns expected by the trained pipeline.
+        Missing numeric columns get NaN (so the pipeline's SimpleImputer will fill them).
+        Missing categorical columns get None.
+        """
+        try:
+            pyfunc_impl = getattr(model, "_model_impl", None)
+            if pyfunc_impl is None:
+                return df_in
+            python_model = getattr(pyfunc_impl, "python_model", None)
+            if python_model is None:
+                return df_in
+            pipeline = getattr(python_model, "pipeline", None)
+            if pipeline is None:
+                return df_in
+            pre = pipeline.named_steps.get("pre")
+            if pre is None:
+                return df_in
+
+            expected_cols = []
+            num_cols = []
+            cat_cols = []
+            # ColumnTransformer stores fitted transformers in .transformers_
+            for name, transformer, cols in getattr(pre, "transformers_", []):
+                if cols is None:
+                    continue
+                expected_cols.extend(cols)
+                # heuristically assume the first transformer is numeric (name == 'num')
+                if name == "num":
+                    num_cols.extend(cols)
+                elif name == "cat":
+                    cat_cols.extend(cols)
+
+            # Add missing columns with sensible placeholders
+            for c in expected_cols:
+                if c not in df_in.columns:
+                    if c in num_cols:
+                        df_in[c] = np.nan
+                    else:
+                        # use None so SimpleImputer can apply most_frequent
+                        df_in[c] = None
+        except Exception:
+            # if anything unexpected happens, return df as-is and let the model raise
+            return df_in
+        # preserve column order by reindexing if possible
+        try:
+            return df_in.reindex(columns=expected_cols)
+        except Exception:
+            return df_in
+
     if st.button("Predict"):
         if st.session_state.model is None:
             st.warning("Load a model from the sidebar first.")
         else:
-            prob = st.session_state.model.predict(df_single)[0]
+            df_safe = _ensure_model_columns(df_single.copy(), st.session_state.model)
+            prob = st.session_state.model.predict(df_safe)[0]
             st.metric("30-day Readmission Probability", f"{prob:.2%}")
             st.progress(min(max(float(prob), 0.0), 1.0))
 
@@ -85,8 +137,9 @@ with tab2:
     file = st.file_uploader("CSV", type=["csv"])
     if file and st.session_state.model is not None:
         df = pd.read_csv(file)
-        # No internal enrich here—assume your training script preprocessed consistently for deployed data.
-        preds = st.session_state.model.predict(df)
+        # Align columns expected by the model (add missing with NaN/None so the pipeline imputers can handle them)
+        df_safe = _ensure_model_columns(df.copy(), st.session_state.model)
+        preds = st.session_state.model.predict(df_safe)
         out = df.copy()
         out["readmission_prob"] = preds
         st.dataframe(out.head(50))
